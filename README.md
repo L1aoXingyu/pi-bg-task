@@ -19,7 +19,7 @@ Restart pi (or start a new session) so the extension loads.
 | `bg_run` | Start a detached background command (`command`, optional `cwd`, `name`, `notify`) |
 | `bg_list` | List tasks for this session |
 | `bg_log` | Bounded log tail |
-| `bg_kill` | SIGTERM the process group and mark cancelled |
+| `bg_kill` | Verify runner identity, then SIGTERM the process group; stale/unverified tasks become `lost` |
 
 Built-in `bash` is **not** overridden. Use `bg_run` only for long jobs.
 
@@ -29,8 +29,8 @@ Built-in `bash` is **not** overridden. Use `bg_run` only for long jobs.
 2. Runner captures stdout/stderr to `output.log`, then atomically writes `exit-code` and `done`
 3. Extension `fs.watch`es the task dir; on completion sends `bg-task-completion` via  
    `pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })`
-4. Exactly-once via exclusive `reported` marker (`wx`)
-5. `session_start` recovers unfinished tasks; finished-while-away tasks are reported once
+4. Completion is enqueued before the exclusive `reported` marker is written; the stable task id supports deduplication if a crash causes a retry
+5. `session_start` recovers unfinished tasks; finished-while-away tasks are reported when the session resumes
 
 ## Example prompts
 
@@ -57,7 +57,7 @@ Then keep working on other tasks while it downloads. Do not sleep or poll.
 ```
 /tmp/pi-bg-task/<base64url session id>/<task id>/
   meta.json command.sh runner.sh output.log
-  exit-code done [cancelled] [reported]
+  exit-code done [cancelled] [lost] [reported]
 ```
 
 Task dirs use mode `0700`. Footer status shows `bg:N running` while tasks are active.
@@ -68,7 +68,17 @@ Task dirs use mode `0700`. Footer status shows `bg:N running` while tasks are ac
 - Completion log tail is capped (200 lines / 32 KB); full path is always included
 - Logs live under the OS temp dir (cleared on reboot)
 - macOS / Linux focused; process-group kill assumes Unix semantics
+- The submitted workload should remain in the foreground; daemonized/backgrounded descendants may outlive the runner
 
 ## License
 
 MIT
+
+## Changelog
+
+### 0.1.1
+- Fix fast-finish race: already-terminal tasks are completed (watchTask + child exit)
+- Fix invalid cwd: preflight + spawn error handling (no unhandled ChildProcess crash)
+- Fix stale PID kill: verify runner identity before SIGTERM; refuse/mark lost otherwise
+- Drop login shell (`-l`); bounded log tail I/O; send completion before `reported` marker
+- Serialize recoverTasks; heal in-map unfinished terminal tasks

@@ -1,6 +1,6 @@
 {
   "name": "pi-bg-task",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Event-driven background shell tasks for Pi coding agent (Claude Code-style bg tasks)",
   "keywords": [
     "pi-package",
@@ -16,7 +16,9 @@
     "url": "git+https://github.com/L1aoXingyu/pi-bg-task.git"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

@@ -5,24 +5,31 @@
  *   bg_run  - start a detached command, returns immediately with a task id
  *   bg_list - list tasks for this session
  *   bg_log  - read bounded tail of a task's log
- *   bg_kill - kill a running task (process-group SIGTERM)
+ *   bg_kill - kill a running task (process-group SIGTERM) after identity check
  *
  * When a task's process exits, a completion message is injected into the
  * session with { deliverAs: "followUp", triggerTurn: true } so the agent
- * automatically continues. Completion is reported exactly once (a "reported"
- * marker file written with the exclusive flag guards against watcher races
- * and survives restarts).
+ * automatically continues.
  *
  * On-disk layout: /tmp/pi-bg-task/<session>/<id>/
- *   meta.json command.sh runner.sh output.log exit-code done [cancelled] [reported]
+ *   meta.json command.sh runner.sh output.log exit-code done
+ *   [cancelled] [lost] [reported]
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, type FSWatcher, watch as fsWatch } from "node:fs";
+import {
+	existsSync,
+	type FSWatcher,
+	openSync,
+	readSync,
+	statSync,
+	closeSync,
+	watch as fsWatch,
+} from "node:fs";
 import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -45,11 +52,13 @@ type Task = {
 	dir: string;
 	watcher?: FSWatcher;
 	reporting?: boolean;
+	/** True if this process launched the task in the current extension instance. */
+	owned?: boolean;
 };
 
-type TaskMeta = Omit<Task, "watcher" | "reporting">;
+type TaskMeta = Omit<Task, "watcher" | "reporting" | "owned">;
 
-type TaskStatus = "running" | "finished" | "cancelled";
+type TaskStatus = "running" | "finished" | "cancelled" | "lost";
 
 const shellQuote = (v: string): string => `'${v.replaceAll("'", "'\"'\"'")}'`;
 
@@ -57,10 +66,89 @@ const sessionRoot = (sessionId: string): string =>
 	join(ROOT_DIR, Buffer.from(sessionId).toString("base64url"));
 
 const logPath = (task: Task): string => join(task.dir, "output.log");
+const runnerPath = (task: Task): string => join(task.dir, "runner.sh");
 
 function taskStatus(task: Task): TaskStatus {
 	if (existsSync(join(task.dir, "cancelled"))) return "cancelled";
+	if (existsSync(join(task.dir, "lost"))) return "lost";
 	return existsSync(join(task.dir, "done")) ? "finished" : "running";
+}
+
+function isDirectory(path: string): boolean {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Verify that `pid` still looks like this task's detached runner group leader.
+ * Used before kill/reconcile so recovered bare PIDs cannot signal unrelated processes.
+ */
+function isOurRunner(pid: number, runner: string): boolean {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	if (!pidAlive(pid)) return false;
+	try {
+		const out = execFileSync(
+			"ps",
+			["-p", String(pid), "-o", "pgid=", "-o", "command="],
+			{ encoding: "utf8" },
+		).trim();
+		if (!out) return false;
+		const match = out.match(/^(\d+)\s+(.*)$/s);
+		if (!match) return false;
+		const pgid = Number(match[1]);
+		const command = match[2].trim();
+		// Detached spawn makes the child its own session/group leader.
+		if (pgid !== pid) return false;
+		// Require the complete argv shape, not a substring: an unrelated group
+		// could otherwise include the known runner path as a harmless extra arg.
+		const runnerArg = shellQuote(runner);
+		return (
+			command === `bash ${runner}` ||
+			command === `/bin/bash ${runner}` ||
+			command === `/usr/bin/bash ${runner}` ||
+			command === `/usr/bin/env bash ${runner}` ||
+			command === `env bash ${runner}` ||
+			command === `bash ${runnerArg}` ||
+			command === `/bin/bash ${runnerArg}` ||
+			command === `/usr/bin/bash ${runnerArg}` ||
+			command === `/usr/bin/env bash ${runnerArg}` ||
+			command === `env bash ${runnerArg}`
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** Read only the last maxBytes of a file (does not load the whole log). */
+function readFileTail(path: string, maxBytes: number): string {
+	try {
+		const st = statSync(path);
+		if (st.size <= 0) return "";
+		const fd = openSync(path, "r");
+		try {
+			const start = Math.max(0, st.size - maxBytes);
+			const len = st.size - start;
+			const buf = Buffer.alloc(len);
+			readSync(fd, buf, 0, len, start);
+			return buf.toString("utf8");
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		return "";
+	}
 }
 
 async function ensureDir(path: string): Promise<void> {
@@ -71,18 +159,18 @@ async function ensureDir(path: string): Promise<void> {
 async function writeRunner(dir: string, command: string): Promise<void> {
 	const q = (name: string) => shellQuote(join(dir, name));
 	await writeFile(join(dir, "command.sh"), command, { mode: 0o700 });
-	// The runner writes exit-code then the "done" marker (both via atomic
-	// rename) so watchers only ever observe complete files.
+	// Non-login bash to match pi's built-in bash semantics.
+	// exit-code then done, both via atomic rename.
 	await writeFile(
 		join(dir, "runner.sh"),
 		`#!/usr/bin/env bash
 set +e
-/bin/bash -l ${q("command.sh")} >${q("output.log")} 2>&1
+/bin/bash ${q("command.sh")} >${q("output.log")} 2>&1
 status=$?
 printf '%s\\n' "$status" >${q("exit-code.tmp")}
-mv ${q("exit-code.tmp")} ${q("exit-code")}
+/bin/mv ${q("exit-code.tmp")} ${q("exit-code")}
 : >${q("done.tmp")}
-mv ${q("done.tmp")} ${q("done")}
+/bin/mv ${q("done.tmp")} ${q("done")}
 exit "$status"
 `,
 		{ mode: 0o700 },
@@ -124,14 +212,22 @@ function completionText(
 	const title =
 		status === "cancelled"
 			? `Background task cancelled: ${label(task)}`
-			: exitCode === 0
-				? `Background task finished: ${label(task)}`
-				: `Background task FAILED: ${label(task)}`;
+			: status === "lost"
+				? `Background task LOST: ${label(task)}`
+				: exitCode === 0
+					? `Background task finished: ${label(task)}`
+					: `Background task FAILED: ${label(task)}`;
 	const lines = [
 		`${title} (exit ${exitCode})`,
 		`Command: ${task.command}`,
+		`Cwd: ${task.cwd}`,
 		`Full log: ${logPath(task)}`,
 	];
+	if (status === "lost") {
+		lines.push(
+			"Reason: process is gone or no longer matches this task's runner (stale/reused PID or unclean death).",
+		);
+	}
 	const tail = truncateTail(output, {
 		maxBytes: MAX_TAIL_BYTES,
 		maxLines: MAX_TAIL_LINES,
@@ -148,9 +244,50 @@ function completionText(
 	return lines.join("\n");
 }
 
+async function spawnDetached(
+	runner: string,
+	cwd: string,
+): Promise<ChildProcess> {
+	if (!isDirectory(cwd)) {
+		throw new Error(`cwd does not exist or is not a directory: ${cwd}`);
+	}
+	const child = spawn(runner, [], {
+		cwd,
+		detached: true,
+		stdio: "ignore",
+	});
+
+	// Consume errors for the child lifetime so Node never treats them as unhandled.
+	child.on("error", () => {});
+
+	await new Promise<void>((resolvePromise, reject) => {
+		const onError = (err: Error) => {
+			cleanup();
+			reject(err);
+		};
+		const onSpawn = () => {
+			cleanup();
+			resolvePromise();
+		};
+		const cleanup = () => {
+			child.off("error", onError);
+			child.off("spawn", onSpawn);
+		};
+		// If spawn already completed synchronously (rare), still wait a tick via listeners.
+		child.once("error", onError);
+		child.once("spawn", onSpawn);
+	});
+
+	if (!child.pid) {
+		throw new Error("Background process did not start (no pid).");
+	}
+	return child;
+}
+
 export default function bgTaskExtension(pi: ExtensionAPI) {
 	const tasks = new Map<string, Task>();
 	let uiCtx: ExtensionContext | undefined;
+	let recoverInflight: Promise<void> | undefined;
 
 	function updateStatus(): void {
 		if (!uiCtx?.hasUI) return;
@@ -168,25 +305,72 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 		task.watcher = undefined;
 	}
 
-	async function completeTask(task: Task): Promise<void> {
-		const status = taskStatus(task);
-		if (task.reporting || status === "running") return;
-		task.reporting = true;
-		stopWatching(task);
-		try {
-			const exitCode = Number.parseInt(
-				await readFile(join(task.dir, "exit-code"), "utf8"),
-				10,
-			);
-			if (!Number.isInteger(exitCode)) throw new Error("invalid exit code");
-			const output = await readFile(logPath(task), "utf8").catch(() => "");
-
-			// Exactly-once guard: exclusive-create marker. If it already exists
-			// (EEXIST), another watcher/run already reported this task.
-			await writeFile(join(task.dir, "reported"), "", {
+	async function markLost(task: Task, reason: string): Promise<void> {
+		if (taskStatus(task) !== "running") return;
+		await writeFile(join(task.dir, "lost"), `${reason}\n`, {
+			flag: "wx",
+			mode: 0o600,
+		}).catch(() => {});
+		// Synthetic exit-code so completeTask can always read one.
+		if (!existsSync(join(task.dir, "exit-code"))) {
+			await writeFile(join(task.dir, "exit-code"), "-1\n", {
 				flag: "wx",
 				mode: 0o600,
-			});
+			}).catch(() => {});
+		}
+	}
+
+	/**
+	 * If markers say "running" but the process is not our runner, mark lost.
+	 * Never signals PIDs here — only classification.
+	 */
+	async function reconcileIdentity(task: Task): Promise<void> {
+		if (taskStatus(task) !== "running") return;
+		// Owned tasks that just started may not show in ps yet; only force-lost
+		// when the process is clearly gone or identity mismatches after launch.
+		if (isOurRunner(task.pid, runnerPath(task))) return;
+		if (task.owned && pidAlive(task.pid)) {
+			// Still alive but command line doesn't match yet / ps lag — don't mark lost.
+			// If it's alive with wrong identity after recovery, owned is false.
+			return;
+		}
+		if (task.owned && Date.now() - task.startedAt < 2000) {
+			// Grace period right after spawn.
+			return;
+		}
+		await markLost(
+			task,
+			isOurRunner(task.pid, runnerPath(task))
+				? "unknown"
+				: pidAlive(task.pid)
+					? "pid_alive_but_not_our_runner"
+					: "process_gone_without_done_marker",
+		);
+	}
+
+	async function completeTask(task: Task): Promise<void> {
+		await reconcileIdentity(task);
+		const status = taskStatus(task);
+		if (task.reporting || status === "running") return;
+		if (existsSync(join(task.dir, "reported"))) {
+			stopWatching(task);
+			updateStatus();
+			return;
+		}
+		task.reporting = true;
+		try {
+			const exitRaw = await readFile(join(task.dir, "exit-code"), "utf8").catch(
+				() => (status === "lost" ? "-1" : ""),
+			);
+			const exitCode = Number.parseInt(exitRaw.trim(), 10);
+			if (!Number.isInteger(exitCode)) {
+				// Marker race: done/lost without readable exit-code yet — retry later.
+				task.reporting = false;
+				return;
+			}
+			const output = readFileTail(logPath(task), MAX_TAIL_BYTES * 2);
+
+			// Deliver first, then durable ack. Prefer at-least-once over lost callbacks.
 			pi.sendMessage(
 				{
 					customType: "bg-task-completion",
@@ -196,9 +380,18 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
 			);
+
+			await writeFile(join(task.dir, "reported"), "", {
+				flag: "wx",
+				mode: 0o600,
+			});
+			stopWatching(task);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-				// Not yet reportable (e.g. exit-code mid-write); allow retry.
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+				// Another path already reported.
+				stopWatching(task);
+			} else {
+				// Keep watcher / allow retry.
 				task.reporting = false;
 				return;
 			}
@@ -208,26 +401,68 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 	}
 
 	function watchTask(task: Task): void {
-		if (task.watcher || taskStatus(task) !== "running") return;
-		task.watcher = fsWatch(task.dir, () => void completeTask(task));
-		// Re-check in case the task finished between the status check and watch.
+		if (existsSync(join(task.dir, "reported"))) {
+			stopWatching(task);
+			return;
+		}
+		// C1: already-terminal tasks must still complete (fast-finish race).
+		if (taskStatus(task) !== "running") {
+			void completeTask(task);
+			return;
+		}
+		if (!task.watcher) {
+			task.watcher = fsWatch(task.dir, () => void completeTask(task));
+			task.watcher.on("error", () => {
+				// Watch is advisory; fall back to a one-shot reconcile.
+				void completeTask(task);
+			});
+		}
+		// Re-check after attaching watcher.
 		void completeTask(task);
 	}
 
 	async function recoverTasks(ctx: ExtensionContext): Promise<void> {
-		const root = sessionRoot(ctx.sessionManager.getSessionId());
-		if (!existsSync(root)) return;
-		for (const entry of await readdir(root, { withFileTypes: true })) {
-			if (!entry.isDirectory() || tasks.has(entry.name)) continue;
-			const meta = await readMeta(join(root, entry.name));
-			if (!meta) continue;
-			const task: Task = { ...meta };
-			tasks.set(task.id, task);
-			if (existsSync(join(task.dir, "reported"))) continue;
-			if (taskStatus(task) === "running") watchTask(task);
-			else void completeTask(task); // finished while pi was closed
+		if (recoverInflight) {
+			await recoverInflight;
+			return;
 		}
-		updateStatus();
+		recoverInflight = (async () => {
+			const root = sessionRoot(ctx.sessionManager.getSessionId());
+			if (!existsSync(root)) return;
+			for (const entry of await readdir(root, { withFileTypes: true })) {
+				if (!entry.isDirectory()) continue;
+				const existing = tasks.get(entry.name);
+				if (existing) {
+					// Heal in-map terminal tasks that never reported (C1 residual).
+					if (
+						!existsSync(join(existing.dir, "reported")) &&
+						taskStatus(existing) !== "running"
+					) {
+						void completeTask(existing);
+					} else if (taskStatus(existing) === "running") {
+						await reconcileIdentity(existing);
+						watchTask(existing);
+					}
+					continue;
+				}
+				const meta = await readMeta(join(root, entry.name));
+				if (!meta) continue;
+				// Reject id/dir mismatch.
+				if (meta.id !== entry.name) continue;
+				const task: Task = { ...meta, owned: false };
+				tasks.set(task.id, task);
+				if (existsSync(join(task.dir, "reported"))) continue;
+				await reconcileIdentity(task);
+				if (taskStatus(task) === "running") watchTask(task);
+				else void completeTask(task);
+			}
+			updateStatus();
+		})();
+		try {
+			await recoverInflight;
+		} finally {
+			recoverInflight = undefined;
+		}
 	}
 
 	function getTask(taskId: string): Task {
@@ -293,34 +528,70 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			await ensureDir(dir);
 			await writeRunner(dir, params.command);
 
-			const cwd = params.cwd ?? ctx.cwd;
-			const child = spawn(join(dir, "runner.sh"), [], {
-				cwd,
-				detached: true,
-				stdio: "ignore",
-			});
-			if (!child.pid) throw new Error("Background process did not start.");
-			child.unref();
+			const cwd = resolve(ctx.cwd, params.cwd ?? ".");
+			let child: ChildProcess;
+			try {
+				child = await spawnDetached(join(dir, "runner.sh"), cwd);
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				throw new Error(`Failed to start background task: ${msg}`);
+			}
 
+			const pid = child.pid!;
 			const task: Task = {
 				id,
-				pid: child.pid,
+				pid,
 				command: params.command,
 				cwd,
 				name: params.name,
 				notify: params.notify,
 				startedAt: Date.now(),
 				dir,
+				owned: true,
 			};
-			await writeFile(
-				join(dir, "meta.json"),
-				JSON.stringify({ ...task }, null, 2),
-				{ mode: 0o600 },
-			);
+
+			try {
+				await writeFile(
+					join(dir, "meta.json"),
+					JSON.stringify(
+						{
+							id: task.id,
+							pid: task.pid,
+							command: task.command,
+							cwd: task.cwd,
+							name: task.name,
+							notify: task.notify,
+							startedAt: task.startedAt,
+							dir: task.dir,
+						},
+						null,
+						2,
+					),
+					{ mode: 0o600 },
+				);
+			} catch (error) {
+				// Launch cleanup: do not leave an untracked detached process.
+				try {
+					process.kill(-pid, "SIGTERM");
+				} catch {
+					/* ignore */
+				}
+				throw error;
+			}
+
 			tasks.set(id, task);
+
+			// C1: exit event as durable wake-up in addition to fs.watch.
+			child.once("exit", () => {
+				// Give runner a moment to write exit-code/done markers.
+				setTimeout(() => void completeTask(task), 50);
+			});
+			child.unref();
+
 			watchTask(task);
 			updateStatus();
 
+			const statusNow = taskStatus(task);
 			return {
 				content: [
 					{
@@ -328,10 +599,17 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 						text:
 							`Started background task ${label(task)} (pid ${task.pid}).\n` +
 							`Log: ${logPath(task)}\n` +
-							`Status: running. Completion will be reported automatically with exit code and log tail — do not poll.`,
+							(statusNow === "running"
+								? "Status: running. Completion will be reported automatically with exit code and log tail — do not poll."
+								: `Status: ${statusNow} (completion may already be queued). Do not poll.`),
 					},
 				],
-				details: { taskId: id, pid: task.pid, logPath: logPath(task) },
+				details: {
+					taskId: id,
+					pid: task.pid,
+					logPath: logPath(task),
+					status: statusNow,
+				},
 			};
 		},
 	});
@@ -344,6 +622,13 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			await recoverTasks(ctx);
+			// Opportunistic reconcile for listed running tasks.
+			for (const task of tasks.values()) {
+				if (taskStatus(task) === "running") {
+					await reconcileIdentity(task);
+					if (taskStatus(task) !== "running") void completeTask(task);
+				}
+			}
 			const rows = [...tasks.values()]
 				.sort((a, b) => a.startedAt - b.startedAt)
 				.map((task) => {
@@ -386,11 +671,16 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			await recoverTasks(ctx);
 			const task = getTask(params.taskId);
-			const raw = await readFile(logPath(task), "utf8").catch(() => "");
-			const tail = truncateTail(raw, {
-				maxBytes: Math.min(params.maxBytes ?? MAX_TAIL_BYTES, MAX_TAIL_BYTES),
-				maxLines: Math.min(params.maxLines ?? MAX_TAIL_LINES, MAX_TAIL_LINES),
-			});
+			const maxBytes = Math.min(
+				Math.max(1, params.maxBytes ?? MAX_TAIL_BYTES),
+				MAX_TAIL_BYTES,
+			);
+			const maxLines = Math.min(
+				Math.max(1, params.maxLines ?? MAX_TAIL_LINES),
+				MAX_TAIL_LINES,
+			);
+			const raw = readFileTail(logPath(task), maxBytes);
+			const tail = truncateTail(raw, { maxBytes, maxLines });
 			const header = `Task ${label(task)} — status: ${taskStatus(task)} — full log: ${logPath(task)}`;
 			return {
 				content: [
@@ -410,13 +700,14 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 		name: "bg_kill",
 		label: "bg_kill",
 		description:
-			"Kill a running background task (SIGTERM to its process group) and mark it cancelled.",
+			"Kill a running background task (SIGTERM to its process group) after verifying process identity. Refuses to signal stale/reused PIDs.",
 		parameters: Type.Object({
 			taskId: Type.String({ description: "Task id from bg_run/bg_list" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			await recoverTasks(ctx);
 			const task = getTask(params.taskId);
+			await reconcileIdentity(task);
 			const status = taskStatus(task);
 			if (status !== "running") {
 				return {
@@ -430,9 +721,26 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 				};
 			}
 
+			const runner = runnerPath(task);
+			if (!isOurRunner(task.pid, runner)) {
+				// C3: never signal an unverified PID.
+				await markLost(task, "kill_refused_unverified_pid");
+				void completeTask(task);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								`Refused to signal task ${label(task)}: pid ${task.pid} is not a verified runner for this task ` +
+								`(gone or reused). Marked lost without killing. Log: ${logPath(task)}`,
+						},
+					],
+					details: { taskId: task.id, status: "lost", signaled: false },
+				};
+			}
+
 			stopWatching(task);
-			// Mark cancelled + reported first so the runner's "done" write does
-			// not race us into sending a completion follow-up for our own kill.
+			// Mark cancelled + reported first so runner "done" does not inject a completion for our kill.
 			await writeFile(join(task.dir, "cancelled"), "", {
 				flag: "wx",
 				mode: 0o600,
@@ -441,19 +749,17 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 				flag: "wx",
 				mode: 0o600,
 			}).catch(() => {});
+
 			try {
-				process.kill(-task.pid, "SIGTERM"); // process group
+				// Only process-group signal. No positive-PID fallback (unsafe after reuse).
+				process.kill(-task.pid, "SIGTERM");
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-					try {
-						process.kill(task.pid, "SIGTERM");
-					} catch {
-						// already gone
-					}
-				} else {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
 					throw error;
 				}
+				// Group already gone — markers already suppress completion.
 			}
+
 			updateStatus();
 			return {
 				content: [
@@ -462,7 +768,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 						text: `Sent SIGTERM to task ${label(task)} (pid group ${task.pid}). Marked cancelled. Log: ${logPath(task)}`,
 					},
 				],
-				details: { taskId: task.id, status: "cancelled" },
+				details: { taskId: task.id, status: "cancelled", signaled: true },
 			};
 		},
 	});
