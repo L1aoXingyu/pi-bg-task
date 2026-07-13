@@ -1,0 +1,26 @@
+{
+  "name": "pi-bg-task",
+  "version": "0.1.0",
+  "description": "Event-driven background shell tasks for Pi coding agent (Claude Code-style bg tasks)",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "background",
+    "bash",
+    "tasks"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/L1aoXingyu/pi-bg-task.git"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
