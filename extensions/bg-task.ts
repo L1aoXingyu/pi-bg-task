@@ -7,9 +7,9 @@
  *   bg_log  - read bounded tail of a task's log
  *   bg_kill - kill a running task (process-group SIGTERM) after identity check
  *
- * When a task's process exits, a user-role completion message is injected
- * with { deliverAs: "followUp" } so the agent automatically continues,
- * including after session compaction.
+ * When a task's process exits, a completion message is injected into the
+ * session with { deliverAs: "followUp", triggerTurn: true } so the agent
+ * automatically continues.
  *
  * On-disk layout: /tmp/pi-bg-task/<session>/<id>/
  *   meta.json command.sh runner.sh output.log exit-code done
@@ -371,11 +371,15 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			const output = readFileTail(logPath(task), MAX_TAIL_BYTES * 2);
 
 			// Deliver first, then durable ack. Prefer at-least-once over lost callbacks.
-			// Use a user-role message: custom-message-triggered turns can produce an
-			// empty assistant response after session compaction.
-			pi.sendUserMessage(completionText(task, status, exitCode, output), {
-				deliverAs: "followUp",
-			});
+			pi.sendMessage(
+				{
+					customType: "bg-task-completion",
+					content: completionText(task, status, exitCode, output),
+					details: { taskId: task.id, name: task.name, exitCode, status },
+					display: true,
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
 
 			await writeFile(join(task.dir, "reported"), "", {
 				flag: "wx",

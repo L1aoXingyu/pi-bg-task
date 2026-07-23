@@ -2,7 +2,7 @@
 
 Event-driven **background shell tasks** for [pi](https://pi.dev) — Claude Code-style.
 
-Start a long-running command, get a task id back immediately, and when the process exits a user-role completion message is injected with `deliverAs: "followUp"` so the agent automatically continues. **No sleep-polling.**
+Start a long-running command, get a task id back immediately, and when the process exits a completion message is injected into the session with `triggerTurn: true` so the agent automatically continues. **No sleep-polling.**
 
 ## Install
 
@@ -27,7 +27,8 @@ Built-in `bash` is **not** overridden. Use `bg_run` only for long jobs.
 
 1. `bg_run` writes `command.sh` + `runner.sh`, spawns detached (`detached: true` + `unref()`)
 2. Runner captures stdout/stderr to `output.log`, then atomically writes `exit-code` and `done`
-3. Extension `fs.watch`es the task dir; on completion sends a user-role message via `pi.sendUserMessage(..., { deliverAs: "followUp" })`, avoiding empty or stale callback responses observed with custom messages after session compaction
+3. Extension `fs.watch`es the task dir; on completion sends `bg-task-completion` via  
+   `pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })`
 4. Completion is enqueued before the exclusive `reported` marker is written; the stable task id supports deduplication if a crash causes a retry
 5. `session_start` recovers unfinished tasks; finished-while-away tasks are reported when the session resumes
 
@@ -74,9 +75,6 @@ Task dirs use mode `0700`. Footer status shows `bg:N running` while tasks are ac
 MIT
 
 ## Changelog
-
-### Unreleased
-- Deliver completions as user-role follow-ups so callbacks remain reliable after session compaction
 
 ### 0.1.1
 - Fix fast-finish race: already-terminal tasks are completed (watchTask + child exit)
