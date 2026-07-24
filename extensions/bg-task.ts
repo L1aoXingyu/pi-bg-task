@@ -36,10 +36,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { buildBackgroundEnvironment } from "../lib/session-env.ts";
 
 const ROOT_DIR = join(tmpdir(), "pi-bg-task");
 const MAX_TAIL_BYTES = 32 * 1024;
 const MAX_TAIL_LINES = 200;
+const COMPACTION_STATE_EVENT = "openai-server-compaction:state";
 
 type Task = {
 	id: string;
@@ -52,13 +54,24 @@ type Task = {
 	dir: string;
 	watcher?: FSWatcher;
 	reporting?: boolean;
+	deliveryAttempts?: number;
 	/** True if this process launched the task in the current extension instance. */
 	owned?: boolean;
 };
 
-type TaskMeta = Omit<Task, "watcher" | "reporting" | "owned">;
+type TaskMeta = Omit<
+	Task,
+	"watcher" | "reporting" | "deliveryAttempts" | "owned"
+>;
 
 type TaskStatus = "running" | "finished" | "cancelled" | "lost";
+
+type PendingCompletion = {
+	task: Task;
+	generation: number;
+	delivered: boolean;
+	acknowledging: boolean;
+};
 
 const shellQuote = (v: string): string => `'${v.replaceAll("'", "'\"'\"'")}'`;
 
@@ -247,6 +260,7 @@ function completionText(
 async function spawnDetached(
 	runner: string,
 	cwd: string,
+	env: NodeJS.ProcessEnv,
 ): Promise<ChildProcess> {
 	if (!isDirectory(cwd)) {
 		throw new Error(`cwd does not exist or is not a directory: ${cwd}`);
@@ -254,6 +268,7 @@ async function spawnDetached(
 	const child = spawn(runner, [], {
 		cwd,
 		detached: true,
+		env,
 		stdio: "ignore",
 	});
 
@@ -288,6 +303,92 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 	const tasks = new Map<string, Task>();
 	let uiCtx: ExtensionContext | undefined;
 	let recoverInflight: Promise<void> | undefined;
+	let compactionActive = false;
+	let compactionBeganInAgentRun: boolean | undefined;
+	let completionFlushTimer: NodeJS.Timeout | undefined;
+	let runtimeGeneration = 0;
+	let runtimeActive = false;
+	const pendingCompletions = new Map<string, PendingCompletion>();
+	const completionInflight = new Set<Promise<void>>();
+
+	function trackCompletion(promise: Promise<void>): void {
+		completionInflight.add(promise);
+		void promise.finally(() => completionInflight.delete(promise));
+	}
+
+	function queueCompletion(task: Task): void {
+		const promise = completeTask(task).catch(() => {
+			task.reporting = false;
+		});
+		trackCompletion(promise);
+	}
+
+	function canUseRuntime(generation: number, task: Task): boolean {
+		return (
+			runtimeActive &&
+			generation === runtimeGeneration &&
+			tasks.get(task.id) === task
+		);
+	}
+
+	function pauseCompletionDelivery(): void {
+		compactionActive = true;
+		if (completionFlushTimer) clearTimeout(completionFlushTimer);
+		completionFlushTimer = undefined;
+		// A callback turn that has not produced an assistant message is not yet
+		// durably acknowledged. Compaction may abort or replace that turn, so let
+		// the terminal task retry after the checkpoint is installed.
+		for (const [taskId, pending] of pendingCompletions) {
+			if (pending.acknowledging) continue;
+			pending.task.reporting = false;
+			pendingCompletions.delete(taskId);
+		}
+	}
+
+	function resumeCompletionDelivery(): void {
+		compactionActive = false;
+		compactionBeganInAgentRun = undefined;
+		if (completionFlushTimer) clearTimeout(completionFlushTimer);
+		// session_compact fires after Pi has installed the compacted checkpoint.
+		// Defer one event-loop turn so the core compact() call can finish before a
+		// callback starts a new model turn.
+		completionFlushTimer = setTimeout(() => {
+			completionFlushTimer = undefined;
+			if (compactionActive) return;
+			for (const task of tasks.values()) {
+				if (
+					!existsSync(join(task.dir, "reported")) &&
+					taskStatus(task) !== "running"
+				) {
+					queueCompletion(task);
+				}
+			}
+		}, 0);
+	}
+
+	const stopCompactionStateListener = pi.events.on(
+		COMPACTION_STATE_EVENT,
+		(data) => {
+			if (!data || typeof data !== "object") return;
+			const state = data as {
+				sessionId?: unknown;
+				active?: unknown;
+				agentRunActive?: unknown;
+			};
+			if (
+				typeof state.sessionId !== "string" ||
+				state.sessionId !== uiCtx?.sessionManager.getSessionId()
+			) {
+				return;
+			}
+			if (state.active !== true) return;
+			compactionBeganInAgentRun =
+				typeof state.agentRunActive === "boolean"
+					? state.agentRunActive
+					: undefined;
+			pauseCompletionDelivery();
+		},
+	);
 
 	function updateStatus(): void {
 		if (!uiCtx?.hasUI) return;
@@ -348,10 +449,45 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 		);
 	}
 
+	async function acknowledgeCompletion(pending: PendingCompletion): Promise<void> {
+		if (pending.acknowledging) return;
+		pending.acknowledging = true;
+		const { task, generation } = pending;
+		try {
+			if (!canUseRuntime(generation, task) || compactionActive) {
+				pending.acknowledging = false;
+				return;
+			}
+			await writeFile(join(task.dir, "reported"), "", {
+				flag: "wx",
+				mode: 0o600,
+			});
+			stopWatching(task);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+				stopWatching(task);
+			} else {
+				task.reporting = false;
+			}
+		} finally {
+			if (pendingCompletions.get(task.id) === pending) {
+				pendingCompletions.delete(task.id);
+			}
+			updateStatus();
+		}
+	}
+
 	async function completeTask(task: Task): Promise<void> {
+		const generation = runtimeGeneration;
 		await reconcileIdentity(task);
+		if (!canUseRuntime(generation, task)) return;
 		const status = taskStatus(task);
 		if (task.reporting || status === "running") return;
+		// Pi 0.82 does not consider manual compaction "streaming". Calling
+		// sendMessage({ triggerTurn: true }) while compact() is replacing agent
+		// state can therefore lose the callback. Keep the durable task terminal
+		// markers unacknowledged and retry after session_compact instead.
+		if (compactionActive) return;
 		if (existsSync(join(task.dir, "reported"))) {
 			stopWatching(task);
 			updateStatus();
@@ -368,9 +504,26 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 				task.reporting = false;
 				return;
 			}
+			// Re-check after the asynchronous marker read. A compaction or session
+			// replacement may have started while I/O was pending.
+			if (!canUseRuntime(generation, task) || compactionActive) {
+				task.reporting = false;
+				return;
+			}
 			const output = readFileTail(logPath(task), MAX_TAIL_BYTES * 2);
+			const pending: PendingCompletion = {
+				task,
+				generation,
+				delivered: false,
+				acknowledging: false,
+			};
+			pendingCompletions.set(task.id, pending);
+			task.deliveryAttempts = (task.deliveryAttempts ?? 0) + 1;
 
-			// Deliver first, then durable ack. Prefer at-least-once over lost callbacks.
+			// The exclusive reported marker is written only after Pi emits this
+			// custom message and a subsequent assistant message. If compaction
+			// replaces the in-flight turn, session_before_compact clears the pending
+			// attempt and the durable terminal task is retried afterward.
 			pi.sendMessage(
 				{
 					customType: "bg-task-completion",
@@ -380,21 +533,9 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
 			);
-
-			await writeFile(join(task.dir, "reported"), "", {
-				flag: "wx",
-				mode: 0o600,
-			});
-			stopWatching(task);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-				// Another path already reported.
-				stopWatching(task);
-			} else {
-				// Keep watcher / allow retry.
-				task.reporting = false;
-				return;
-			}
+		} catch {
+			pendingCompletions.delete(task.id);
+			task.reporting = false;
 		} finally {
 			updateStatus();
 		}
@@ -407,18 +548,18 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 		}
 		// C1: already-terminal tasks must still complete (fast-finish race).
 		if (taskStatus(task) !== "running") {
-			void completeTask(task);
+			queueCompletion(task);
 			return;
 		}
 		if (!task.watcher) {
-			task.watcher = fsWatch(task.dir, () => void completeTask(task));
+			task.watcher = fsWatch(task.dir, () => queueCompletion(task));
 			task.watcher.on("error", () => {
 				// Watch is advisory; fall back to a one-shot reconcile.
-				void completeTask(task);
+				queueCompletion(task);
 			});
 		}
 		// Re-check after attaching watcher.
-		void completeTask(task);
+		queueCompletion(task);
 	}
 
 	async function recoverTasks(ctx: ExtensionContext): Promise<void> {
@@ -438,7 +579,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 						!existsSync(join(existing.dir, "reported")) &&
 						taskStatus(existing) !== "running"
 					) {
-						void completeTask(existing);
+						queueCompletion(existing);
 					} else if (taskStatus(existing) === "running") {
 						await reconcileIdentity(existing);
 						watchTask(existing);
@@ -454,7 +595,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 				if (existsSync(join(task.dir, "reported"))) continue;
 				await reconcileIdentity(task);
 				if (taskStatus(task) === "running") watchTask(task);
-				else void completeTask(task);
+				else queueCompletion(task);
 			}
 			updateStatus();
 		})();
@@ -477,11 +618,92 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		uiCtx = ctx;
+		runtimeGeneration++;
+		runtimeActive = true;
+		compactionActive = false;
+		compactionBeganInAgentRun = undefined;
 		await recoverTasks(ctx);
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_before_compact", (_event, ctx) => {
+		compactionBeganInAgentRun = !ctx.isIdle();
+		pauseCompletionDelivery();
+	});
+
+	pi.on("session_compact", () => {
+		resumeCompletionDelivery();
+	});
+
+	// A failed/cancelled idle compaction has no session_compact event. The next
+	// real agent turn is a safe recovery point for durable terminal callbacks.
+	pi.on("before_agent_start", () => {
+		if (compactionActive) resumeCompletionDelivery();
+	});
+
+	// Compaction failure inside an active agent run settles through that run.
+	// Manual and pre-prompt compactions are idle, so an unrelated/pre-existing
+	// agent_settled must not reopen delivery while their compact() is active.
+	pi.on("agent_settled", () => {
+		if (compactionActive && compactionBeganInAgentRun === true) {
+			resumeCompletionDelivery();
+		}
+		if (compactionActive) return;
+		for (const [taskId, pending] of pendingCompletions) {
+			if (pending.acknowledging) continue;
+			pendingCompletions.delete(taskId);
+			pending.task.reporting = false;
+			const attempts = pending.task.deliveryAttempts ?? 0;
+			if (attempts < 3) {
+				setTimeout(() => queueCompletion(pending.task), 1000);
+			}
+		}
+	});
+
+	pi.on("message_end", (event) => {
+		if (event.message.role === "custom") {
+			if (event.message.customType !== "bg-task-completion") return;
+			const details = event.message.details;
+			if (!details || typeof details !== "object") return;
+			const taskId = (details as { taskId?: unknown }).taskId;
+			if (typeof taskId !== "string") return;
+			const pending = pendingCompletions.get(taskId);
+			if (pending && canUseRuntime(pending.generation, pending.task)) {
+				pending.delivered = true;
+			}
+			return;
+		}
+		if (
+			event.message.role !== "assistant" ||
+			event.message.stopReason !== "stop" ||
+			compactionActive
+		) {
+			return;
+		}
+		for (const pending of pendingCompletions.values()) {
+			if (
+				pending.delivered &&
+				!pending.acknowledging &&
+				canUseRuntime(pending.generation, pending.task)
+			) {
+				trackCompletion(acknowledgeCompletion(pending));
+			}
+		}
+	});
+
+	pi.on("session_shutdown", async () => {
+		runtimeActive = false;
+		runtimeGeneration++;
+		if (completionFlushTimer) clearTimeout(completionFlushTimer);
+		completionFlushTimer = undefined;
+		compactionActive = false;
+		compactionBeganInAgentRun = undefined;
+		stopCompactionStateListener();
+		for (const pending of pendingCompletions.values()) {
+			pending.task.reporting = false;
+		}
+		pendingCompletions.clear();
 		for (const task of tasks.values()) stopWatching(task);
+		await Promise.allSettled([...completionInflight]);
 		tasks.clear();
 	});
 
@@ -531,7 +753,10 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			const cwd = resolve(ctx.cwd, params.cwd ?? ".");
 			let child: ChildProcess;
 			try {
-				child = await spawnDetached(join(dir, "runner.sh"), cwd);
+				// Resolve session/model state for every launch rather than inheriting
+				// potentially stale PI_* values from the parent process.
+				const env = buildBackgroundEnvironment(process.env, ctx);
+				child = await spawnDetached(join(dir, "runner.sh"), cwd, env);
 			} catch (error) {
 				const msg = error instanceof Error ? error.message : String(error);
 				throw new Error(`Failed to start background task: ${msg}`);
@@ -584,7 +809,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			// C1: exit event as durable wake-up in addition to fs.watch.
 			child.once("exit", () => {
 				// Give runner a moment to write exit-code/done markers.
-				setTimeout(() => void completeTask(task), 50);
+				setTimeout(() => queueCompletion(task), 50);
 			});
 			child.unref();
 
@@ -626,7 +851,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			for (const task of tasks.values()) {
 				if (taskStatus(task) === "running") {
 					await reconcileIdentity(task);
-					if (taskStatus(task) !== "running") void completeTask(task);
+					if (taskStatus(task) !== "running") queueCompletion(task);
 				}
 			}
 			const rows = [...tasks.values()]
@@ -725,7 +950,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			if (!isOurRunner(task.pid, runner)) {
 				// C3: never signal an unverified PID.
 				await markLost(task, "kill_refused_unverified_pid");
-				void completeTask(task);
+				queueCompletion(task);
 				return {
 					content: [
 						{

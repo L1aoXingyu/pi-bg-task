@@ -10,7 +10,7 @@ Start a long-running command, get a task id back immediately, and when the proce
 pi install git:github.com/L1aoXingyu/pi-bg-task
 ```
 
-Restart pi (or start a new session) so the extension loads.
+Restart pi (or start a new session) so the extension loads. Version 0.1.2 targets Pi 0.82 or newer.
 
 ## Tools
 
@@ -29,8 +29,20 @@ Built-in `bash` is **not** overridden. Use `bg_run` only for long jobs.
 2. Runner captures stdout/stderr to `output.log`, then atomically writes `exit-code` and `done`
 3. Extension `fs.watch`es the task dir; on completion sends `bg-task-completion` via  
    `pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })`
-4. Completion is enqueued before the exclusive `reported` marker is written; the stable task id supports deduplication if a crash causes a retry
-5. `session_start` recovers unfinished tasks; finished-while-away tasks are reported when the session resumes
+4. If Pi is compacting, delivery remains paused until the compacted checkpoint is installed; the Codex compaction extension also announces this state through Pi's inter-extension event bus regardless of extension load order
+5. The exclusive `reported` marker is written only after Pi emits the structured callback and a successful assistant response; interrupted turns remain retryable, and the stable task id supports at-least-once deduplication
+6. `session_start` recovers unfinished tasks; finished-while-away tasks are reported when the session resumes
+
+## Pi 0.82 session environment
+
+Each `bg_run` launch receives the same current session metadata exposed by Pi 0.82's built-in bash tool:
+
+- `PI_SESSION_ID`
+- `PI_SESSION_FILE` (unset for ephemeral sessions)
+- `PI_PROVIDER` and `PI_MODEL` (unset when no model is selected)
+- `PI_REASONING_LEVEL` (unset when unavailable)
+
+These values are resolved from the tool context when the detached process starts, so session, model, and reasoning changes apply to the next launch. Stale inherited values are removed when current metadata is unavailable. `PI_CODING_AGENT` and unrelated environment variables remain inherited.
 
 ## Example prompts
 
@@ -75,6 +87,13 @@ Task dirs use mode `0700`. Footer status shows `bg:N running` while tasks are ac
 MIT
 
 ## Changelog
+
+### 0.1.2
+- Add Pi 0.82-compatible launch-time propagation for session, model, and reasoning environment variables
+- Defer durable completion callbacks while Pi compaction is replacing session state, including load-order-independent coordination with `pi-openai-server-compaction`
+- Acknowledge callbacks only after structured delivery plus a successful assistant turn; generation-fence reload/shutdown and retry interrupted attempts up to three times per runtime
+- Remove stale inherited session metadata when current values are unavailable while preserving `PI_CODING_AGENT` and unrelated variables
+- Add focused unit smoke coverage for dynamic environment replacement and stale-value removal
 
 ### 0.1.1
 - Fix fast-finish race: already-terminal tasks are completed (watchTask + child exit)

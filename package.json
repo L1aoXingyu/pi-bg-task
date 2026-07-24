@@ -1,7 +1,12 @@
 {
   "name": "pi-bg-task",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Event-driven background shell tasks for Pi coding agent (Claude Code-style bg tasks)",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -24,5 +29,9 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3"
   }
 }
