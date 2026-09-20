@@ -66,7 +66,7 @@ test("reject unsupported routes, delta/background/store payloads and missing cac
 });
 test("economics includes cached context, uncached suffix and output, rejects unknown pricing", () => {
 	const e = warmingEconomics(model,usage())!;
-	assert.ok(e.estimate > .1); assert.equal(e.budget,.45);
+	assert.ok(e.estimate > .1); assert.equal(e.budget,.855);
 	assert.equal(warmingEconomics({...model,cost:{...model.cost,cacheRead:0}},usage()),undefined);
 	assert.equal(warmingEconomics(model,usage(100,0)),undefined);
 });
@@ -81,14 +81,15 @@ test("default off; opt-in waits for a fresh request; 25 minute schedule", async 
 	assert.equal(logs[0].data.usageComplete,true); assert.ok(!JSON.stringify(logs).includes("private fixture"));
 	assert.equal(h.entries.filter(e=>e.type==="message").length,2); // only the two real requests
 });
-test("four refresh limit survives status commands and does not repeat indefinitely", async () => {
+test("eight refresh limit survives status commands and does not repeat indefinitely", async () => {
 	const h=harness(); await h.emit("session_start"); await h.command("on"); await h.ready();
-	for(let i=0;i<5;i++){await h.advance(); await h.command("status");}
-	assert.equal(h.calls.length,4); assert.equal(h.timers.size,0); assert.equal(h.warm.status().state,"refresh limit");
+	h.state.response=result(usage(154,99846));
+	for(let i=0;i<9;i++){await h.advance(); await h.command("status");}
+	assert.equal(h.calls.length,8); assert.equal(h.timers.size,0); assert.equal(h.warm.status().state,"refresh limit");
 });
 test("estimated budget exhaustion stops subsequent refreshes", async () => {
 	const h=harness(); await h.emit("session_start"); await h.command("on"); await h.ready();
-	h.state.response.usage.cost.total=.44; await h.advance(); await h.advance();
+	h.state.response.usage.cost.total=.85; await h.advance(); await h.advance();
 	assert.equal(h.calls.length,1); assert.equal(h.warm.status().state,"budget reached");
 });
 for (const event of ["agent_start","model_select","thinking_level_select","session_before_compact","session_compact","session_before_tree","session_tree"]) {

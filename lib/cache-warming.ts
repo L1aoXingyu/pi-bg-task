@@ -5,10 +5,10 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 export const WARMING_POLICY = Object.freeze({
 	intervalMs: 25 * 60_000,
-	maxIdleMs: 150 * 60_000,
-	maxRefreshes: 4,
+	maxIdleMs: 225 * 60_000,
+	maxRefreshes: 8,
 	maxEstimatedUsd: 1,
-	maxMissCostFraction: 0.5,
+	maxMissCostFraction: 0.95,
 	minCacheHitRatio: 0.9,
 	maxOutputTokens: 128,
 	timeoutMs: 45_000,
