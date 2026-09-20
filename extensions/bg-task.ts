@@ -37,6 +37,7 @@ import type {
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { buildBackgroundEnvironment } from "../lib/session-env.ts";
+import { registerCacheWarming } from "../lib/cache-warming.ts";
 
 const ROOT_DIR = join(tmpdir(), "pi-bg-task");
 const MAX_TAIL_BYTES = 32 * 1024;
@@ -332,6 +333,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 	}
 
 	function pauseCompletionDelivery(): void {
+		warming.invalidate("compaction");
 		compactionActive = true;
 		if (completionFlushTimer) clearTimeout(completionFlushTimer);
 		completionFlushTimer = undefined;
@@ -389,6 +391,11 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			pauseCompletionDelivery();
 		},
 	);
+
+	function tasksChanged(): void {
+		warming.tasksChanged();
+		updateStatus();
+	}
 
 	function updateStatus(): void {
 		if (!uiCtx?.hasUI) return;
@@ -473,7 +480,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			if (pendingCompletions.get(task.id) === pending) {
 				pendingCompletions.delete(task.id);
 			}
-			updateStatus();
+			tasksChanged();
 		}
 	}
 
@@ -490,7 +497,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 		if (compactionActive) return;
 		if (existsSync(join(task.dir, "reported"))) {
 			stopWatching(task);
-			updateStatus();
+			tasksChanged();
 			return;
 		}
 		task.reporting = true;
@@ -524,6 +531,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			// custom message and a subsequent assistant message. If compaction
 			// replaces the in-flight turn, session_before_compact clears the pending
 			// attempt and the durable terminal task is retried afterward.
+			warming.invalidate("background task completed");
 			pi.sendMessage(
 				{
 					customType: "bg-task-completion",
@@ -537,7 +545,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			pendingCompletions.delete(task.id);
 			task.reporting = false;
 		} finally {
-			updateStatus();
+			tasksChanged();
 		}
 	}
 
@@ -597,7 +605,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 				if (taskStatus(task) === "running") watchTask(task);
 				else queueCompletion(task);
 			}
-			updateStatus();
+			tasksChanged();
 		})();
 		try {
 			await recoverInflight;
@@ -615,6 +623,12 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 		}
 		return task;
 	}
+
+	const warming = registerCacheWarming(pi, {
+		runningIds: () => [...tasks.values()].filter(t => taskStatus(t) === "running").map(t => t.id),
+		blocked: () => !runtimeActive || compactionActive,
+		reconcile: recoverTasks,
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		uiCtx = ctx;
@@ -814,7 +828,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 			child.unref();
 
 			watchTask(task);
-			updateStatus();
+			tasksChanged();
 
 			const statusNow = taskStatus(task);
 			return {
@@ -985,7 +999,7 @@ export default function bgTaskExtension(pi: ExtensionAPI) {
 				// Group already gone — markers already suppress completion.
 			}
 
-			updateStatus();
+			tasksChanged();
 			return {
 				content: [
 					{
