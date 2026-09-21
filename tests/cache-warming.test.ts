@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai";
-import { capturePayload, eligibleModel, refreshIntervalMs, refreshLimit, refreshPayload, registerCacheWarming, replaySafe, streamRefresh, warmingEconomics, WARMING_POLICY as P } from "../lib/cache-warming.ts";
+import { capturePayload, eligibleModel, maintenanceTextAccepted, refreshIntervalMs, refreshLimit, refreshOutputAccepted, refreshPayload, registerCacheWarming, replaySafe, streamRefresh, visibleOutputTokens, warmingEconomics, WARMING_POLICY as P } from "../lib/cache-warming.ts";
 
 const model = { id: "gpt-6-astra", provider: "openai-codex", api: "openai-codex-responses", name: "test", reasoning: true, input: ["text"], contextWindow: 500000, maxTokens: 10000, cost: {input: 10, cacheRead: 1, cacheWrite: 0, output: 50} } as Model<Api>;
 const grok = { ...model, id: "grok-4.6", provider: "xai", api: "openai-responses" } as Model<Api>;
@@ -67,6 +67,20 @@ test("payload replay appends only maintenance and preserves system/tools/reasoni
 	assert.deepEqual(p, copy); assert.deepEqual(warm.input!.slice(0,-2), p.input);
 	const {input: a,...before} = p, {input: b,...after} = warm;
 	assert.deepEqual(before, after); assert.match(JSON.stringify(b!.at(-1)), /Reply exactly OK/);
+	assert.equal("max_output_tokens" in warm, false);
+});
+test("reasoning tokens billed inside output are not unexpected; OK variants are accepted", () => {
+	assert.equal(visibleOutputTokens(usage(1000, 99000, 205)), 205);
+	assert.equal(visibleOutputTokens({...usage(1000, 99000, 205), reasoning: 200}), 5);
+	assert.equal(maintenanceTextAccepted("OK"), true);
+	assert.equal(maintenanceTextAccepted("ok."), true);
+	assert.equal(maintenanceTextAccepted(""), true);
+	assert.equal(maintenanceTextAccepted("I will continue"), false);
+	const heavy = result({...usage(154, 99846, 205), reasoning: 200});
+	assert.equal(refreshOutputAccepted(heavy), true);
+	assert.equal(refreshOutputAccepted(result(usage(), "OK.")), true);
+	assert.equal(refreshOutputAccepted(result(usage(1000, 99000, 129))), false);
+	assert.equal(refreshOutputAccepted(result(usage(), "I will do work")), false);
 });
 test("reject delta/background/store payloads; all providers with a model id are eligible", () => {
 	assert.equal(eligibleModel(model), true);
@@ -129,6 +143,14 @@ for(const variant of ["cache-miss","too-much-output","wrong-response","error"]) 
 		await h.advance();assert.equal(h.warm.status().enabled,false);await h.ready();await h.advance();assert.equal(h.calls.length,1);
 	});
 }
+test("gpt-6-astra-style hidden reasoning does not pause warming", async () => {
+	const h=harness();await h.emit("session_start");await h.ready();
+	h.state.response=result({...usage(154,99846,205), reasoning:200});
+	await h.advance();
+	assert.equal(h.calls.length,1);
+	assert.equal(h.warm.status().enabled,true);
+	assert.notEqual(h.warm.status().state,"unexpected output");
+});
 test("foreground request aborts in-flight refresh, accounts unknown usage, does not disable future warming",async()=>{
 	const h=harness();await h.emit("session_start");await h.command("on");await h.ready();h.state.slow=true;
 	await h.advance();assert.equal(h.calls.length,1);await h.emit("agent_start");await flush();

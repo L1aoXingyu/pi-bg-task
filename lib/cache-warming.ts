@@ -99,6 +99,8 @@ function assistantBoundary(generated: unknown, payload: Payload): unknown[] | un
 	if (Array.isArray(g.messages)) return g.messages as unknown[];
 }
 function capRefreshOutput(body: Payload): void {
+	// Codex ChatGPT rejects max_output_tokens. Leave Responses/input bodies
+	// unchanged unless the captured request already had a cap (xAI/OpenAI Responses).
 	if (conversationKey(body) === "input") {
 		if (typeof body.max_output_tokens === "number") body.max_output_tokens = Math.min(body.max_output_tokens, 32);
 		return;
@@ -108,6 +110,21 @@ function capRefreshOutput(body: Payload): void {
 	if (typeof body.max_completion_tokens === "number") {
 		body.max_completion_tokens = Math.min(body.max_completion_tokens, 32);
 	}
+}
+/** OpenAI reports reasoning inside output_tokens. Visible tokens are the remainder. */
+export function visibleOutputTokens(usage: Usage): number {
+	const reasoning = usage.reasoning ?? 0;
+	if (!Number.isFinite(reasoning) || reasoning <= 0) return usage.output;
+	return Math.max(0, usage.output - Math.min(reasoning, usage.output));
+}
+export function maintenanceTextAccepted(text: string): boolean {
+	const t = text.trim();
+	return t.length === 0 || /^ok[.!]?\s*$/i.test(t);
+}
+export function refreshOutputAccepted(result: Pick<AssistantMessage, "content" | "usage">): boolean {
+	if (result.content.some(c => c.type === "toolCall")) return false;
+	const text = result.content.filter(c => c.type === "text").map(c => c.text).join("");
+	return maintenanceTextAccepted(text) && visibleOutputTokens(result.usage) <= WARMING_POLICY.maxOutputTokens;
 }
 export function capturePayload(value: unknown, model: Model<Api>): Payload | undefined {
 	if (!value || typeof value !== "object") return;
@@ -303,8 +320,7 @@ export function registerCacheWarming(pi: ExtensionAPI, jobs: Jobs, clock: Clock 
 		if (sample !== s || closing) return;
 		if (!result || result.stopReason !== "stop" || !usableUsage(result.usage)) { pause("error/timeout or unknown usage"); return; }
 		const u = result.usage;
-		const text = result.content.filter(c => c.type === "text").map(c => c.text).join("").trim();
-		if (text !== "OK" || u.output > WARMING_POLICY.maxOutputTokens || (u.reasoning ?? 0) > WARMING_POLICY.maxOutputTokens) { pause("unexpected output"); return; }
+		if (!refreshOutputAccepted(result)) { pause("unexpected output"); return; }
 		const prompt = u.input + u.cacheRead + u.cacheWrite;
 		if (!prompt || u.cacheRead / prompt < WARMING_POLICY.minCacheHitRatio) { pause("cache hit below 90%"); return; }
 		s.lastWarmAt = startedAt;
