@@ -10,7 +10,7 @@ Start a long-running command, get a task id back immediately, and when the proce
 pi install git:github.com/L1aoXingyu/pi-bg-task
 ```
 
-Restart pi (or `/reload`) so the extension loads. Version 0.2.1 targets Pi 0.85.1 or newer; background jobs survive reload.
+Restart pi (or `/reload`) so the extension loads. Version 0.2.2 targets Pi 0.85.1 or newer; background jobs survive reload.
 
 ## Tools
 
@@ -44,22 +44,22 @@ Each `bg_run` launch receives the same current session metadata exposed by Pi 0.
 
 These values are resolved from the tool context when the detached process starts, so session, model, and reasoning changes apply to the next launch. Stale inherited values are removed when current metadata is unavailable. `PI_CODING_AGENT` and unrelated environment variables remain inherited.
 
-## Background-job cache warming (opt-in)
+## Background-job cache warming (default on)
 
-For **`openai-codex/gpt-6-astra` only**, enable best-effort refreshes while this session has running background jobs:
+While this session has running background jobs, the extension keeps the current model's prompt cache warm with best-effort refreshes. It is **on by default** for every Pi model whose request payload can be replayed (`input` Responses bodies and `messages` Completions/Anthropic bodies). `/bg-warm off` disables it for the current session.
 
 ```text
-/bg-warm on
 /bg-warm status
 /bg-warm off
+/bg-warm on
 ```
 
-The choice is persisted in the current session, not globally. New sessions default to off. After enabling or reloading, warming waits for the **next successful real model request**; it never reconstructs or immediately replays an old session. Other providers (including xAI and Cursor) are intentionally not enabled yet.
+The choice is persisted in the current session, not globally. New sessions default to on. After enabling, reloading, or switching models, warming waits for the **next successful real model request**; it never reconstructs or immediately replays an old session. Cursor CLI sessions are out of scope. Models without cache pricing, or Anthropic requests with non-adaptive thinking, are skipped rather than guessed.
 
 ### Policy and safeguards
 
 - Pi must be idle, without queued messages, and at least one tracked job must still be running. Runner identities are reconciled before sending.
-- Refresh every **25 minutes**, at most **8 times** per real-request/idle period; 225-minute absolute horizon. This is an experimental cadence, **not a provider TTL guarantee**. Eight refreshes happen at approximately 25/50/75/100/125/150/175/200 minutes if all checks pass.
+- Default cadence is **25 minutes**, at most **8 times** per real-request/idle period; 225-minute absolute horizon. If the model declares `promptCache.short`, refreshes use 90% of that TTL instead and may exceed eight attempts so the same idle horizon still fits. The 25-minute cadence is experimental, **not a provider TTL guarantee**. Eight default-cadence refreshes happen at approximately 25/50/75/100/125/150/175/200 minutes if all checks pass.
 - Before each refresh, estimated cumulative spend must fit both **$1** and **95% of the estimated extra cost of one cache miss** (leaving a 5% estimated savings margin). Small contexts (<4k tokens), unavailable pricing, or uneconomic refreshes are skipped.
 - A refresh preserves the captured request prefix, tool schemas, reasoning settings and cache key; appends the serialized last assistant response plus a short maintenance request; expects `OK`. Codex's normal `auto` transport retains session affinity. The next foreground call may need a full-context transmission instead of a WebSocket delta; refresh text is never put into its history. **No returned tool is executed.**
 - Maintenance instructions and responses are never appended to the conversation. Payloads stay in memory only and are released when invalidated or exhausted.
@@ -80,7 +80,7 @@ Session JSONL contains non-context `custom` entries:
 
 These entries contain **no prompt text, response text, API keys or headers**. They do not change model history. Refresh usage is tracked separately and is **not included in Pi's native `/session` totals**, because the public extension API does not expose standalone usage accounting. Include `bg-task-cache-warm` records when comparing total usage before/after rollout. Unknown usage must not be counted as zero.
 
-Native Pi cache warming is suppressed for this supported route while the extension mode is enabled, preventing duplicate refreshes. No Pi core, model catalog, global cache TTL, or authentication settings are patched.
+Native Pi cache warming is suppressed only while this extension has a live job-aware snapshot for the same model, preventing duplicate refreshes. No Pi core, model catalog, global cache TTL, or authentication settings are patched.
 
 ## Example prompts
 
@@ -125,6 +125,12 @@ Task dirs use mode `0700`. Footer status shows `bg:N running` while tasks are ac
 MIT
 
 ## Changelog
+
+### 0.2.2
+- Default `/bg-warm` on for new sessions instead of opt-in.
+- Warm any replayable Pi model, not only `openai-codex/gpt-6-astra`: Responses `input` payloads and Completions/Anthropic `messages` payloads.
+- Use declared `promptCache.short` lifetimes when present; skip Anthropic budget-based thinking replays; cap Completions `max_tokens` on refresh.
+- Suppress native Pi warming only while a job-aware snapshot is live.
 
 ### 0.2.1
 - Raise the idle-period refresh cap to eight and the horizon to 225 minutes for long training jobs.
