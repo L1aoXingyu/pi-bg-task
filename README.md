@@ -10,7 +10,7 @@ Start a long-running command, get a task id back immediately, and when the proce
 pi install git:github.com/L1aoXingyu/pi-bg-task
 ```
 
-Restart pi (or `/reload`) so the extension loads. Version 0.2.3 targets Pi 0.85.1 or newer; background jobs survive reload.
+Restart pi (or start a new session) so the extension loads. Version 0.1.2 targets Pi 0.82 or newer.
 
 ## Tools
 
@@ -43,44 +43,6 @@ Each `bg_run` launch receives the same current session metadata exposed by Pi 0.
 - `PI_REASONING_LEVEL` (unset when unavailable)
 
 These values are resolved from the tool context when the detached process starts, so session, model, and reasoning changes apply to the next launch. Stale inherited values are removed when current metadata is unavailable. `PI_CODING_AGENT` and unrelated environment variables remain inherited.
-
-## Background-job cache warming (default on)
-
-While this session has running background jobs, the extension keeps the current model's prompt cache warm with best-effort refreshes. It is **on by default** for every Pi model whose request payload can be replayed (`input` Responses bodies and `messages` Completions/Anthropic bodies). `/bg-warm off` disables it for the current session.
-
-```text
-/bg-warm status
-/bg-warm off
-/bg-warm on
-```
-
-The choice is persisted in the current session, not globally. New sessions default to on. After enabling, reloading, or switching models, warming waits for the **next successful real model request**; it never reconstructs or immediately replays an old session. Cursor CLI sessions are out of scope. Models without cache pricing, or Anthropic requests with non-adaptive thinking, are skipped rather than guessed.
-
-### Policy and safeguards
-
-- Pi must be idle, without queued messages, and at least one tracked job must still be running. Runner identities are reconciled before sending.
-- Default cadence is **25 minutes**, at most **8 times** per real-request/idle period; 225-minute absolute horizon. If the model declares `promptCache.short`, refreshes use 90% of that TTL instead and may exceed eight attempts so the same idle horizon still fits. The 25-minute cadence is experimental, **not a provider TTL guarantee**. Eight default-cadence refreshes happen at approximately 25/50/75/100/125/150/175/200 minutes if all checks pass.
-- Before each refresh, estimated cumulative spend must fit both **$1** and **95% of the estimated extra cost of one cache miss** (leaving a 5% estimated savings margin). Small contexts (<4k tokens), unavailable pricing, or uneconomic refreshes are skipped.
-- A refresh preserves the captured request prefix, tool schemas, reasoning settings and cache key; appends the serialized last assistant response plus a short maintenance request; expects a short `OK` (or empty) acknowledgement. Codex's normal `auto` transport retains session affinity. The next foreground call may need a full-context transmission instead of a WebSocket delta; refresh text is never put into its history. **No returned tool is executed.** Codex rejects `max_output_tokens`; that field is never added to Codex refreshes.
-- Maintenance instructions and responses are never appended to the conversation. Payloads stay in memory only and are released when invalidated or exhausted.
-- A new agent run, completion callback, model/thinking change, compaction, branch navigation, no running jobs, or shutdown cancels warming. Reload preserves jobs/opt-in but requires a fresh real request before warming again.
-- Each refresh has a 45-second client timeout, no configured retries, and streaming guards (256 visible characters / 2048 visible reasoning characters). More than 128 **visible** output tokens (OpenAI `output_tokens` minus `reasoning_tokens`), a non-OK reply, a tool call, errors, missing usage, or a cache-hit ratio below 90% pause the feature until `/bg-warm on`. Hidden reasoning on gpt-6-astra is expected and is not treated as unexpected output.
-
-**These are spending cutoffs, not guaranteed server-side billing limits.** Codex does not enforce Pi's `maxTokens` setting; a cache miss or hidden reasoning can cost more than estimated. Client cancellation may leave unknown usage. Subscription dollar values are estimates, not account charges. Prompt-prefix preservation is best-effort if later-loaded extensions rewrite provider payloads or headers. A successful short-gap probe does not establish multi-hour retention or savings.
-
-### Verify during real use
-
-The footer has a separate `warm:` status. `/bg-warm status` shows the next scheduled time (Unix milliseconds), attempt counts, estimated spend, and unknown-usage count. When a safeguard pauses warming, a UI notice explains why.
-
-Session JSONL contains non-context `custom` entries:
-
-- `bg-task-warming-config`: session opt-in/pause state.
-- `bg-task-cache-observation`: normal request usage, request gap and payload hash while jobs are active.
-- `bg-task-cache-warm`: refresh usage, cache read/input/output/reasoning, job IDs, attempt, interruption and usage-completeness flags.
-
-These entries contain **no prompt text, response text, API keys or headers**. They do not change model history. Refresh usage is tracked separately and is **not included in Pi's native `/session` totals**, because the public extension API does not expose standalone usage accounting. Include `bg-task-cache-warm` records when comparing total usage before/after rollout. Unknown usage must not be counted as zero.
-
-Native Pi cache warming is suppressed only while this extension has a live job-aware snapshot for the same model, preventing duplicate refreshes. No Pi core, model catalog, global cache TTL, or authentication settings are patched.
 
 ## Example prompts
 
@@ -125,23 +87,6 @@ Task dirs use mode `0700`. Footer status shows `bg:N running` while tasks are ac
 MIT
 
 ## Changelog
-
-### 0.2.2
-- Default `/bg-warm` on for new sessions instead of opt-in.
-- Warm any replayable Pi model, not only `openai-codex/gpt-6-astra`: Responses `input` payloads and Completions/Anthropic `messages` payloads.
-- Use declared `promptCache.short` lifetimes when present; skip Anthropic budget-based thinking replays; cap Completions `max_tokens` on refresh.
-- Suppress native Pi warming only while a job-aware snapshot is live.
-
-### 0.2.1
-- Raise the idle-period refresh cap to eight and the horizon to 225 minutes for long training jobs.
-- Allow up to 95% of estimated avoided miss cost while keeping the $1 cutoff; budget checks can still stop earlier than eight.
-
-### 0.2.0
-- Add opt-in job-aware Codex Astra cache warming via `/bg-warm on|off|status`.
-- Preserve request prefix and assistant-message boundary; isolate refreshes from normal conversation/tool execution and normal history.
-- Add bounded scheduling, estimate-based economics, cancellation/lifecycle guards, cache-hit checks and non-context usage diagnostics.
-- Support Pi 0.85.1 provider streaming and Pi 0.86+ registry streaming without upgrading running sessions.
-- Add deterministic mocked-timer, lifecycle, accounting, payload and compatibility tests.
 
 ### 0.1.2
 - Add Pi 0.82-compatible launch-time propagation for session, model, and reasoning environment variables
